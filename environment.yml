@@ -53,6 +53,7 @@ dependencies:
   - xz=5.4.6=h5eee18b_0
   - zeromq=4.3.5=h6a678d5_0
   - zlib=1.2.13=h5eee18b_0
+  - pip
   - pip:
       - absl-py==2.1.0
       - accelerate==0.29.2

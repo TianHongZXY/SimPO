@@ -557,6 +557,44 @@ class SimPOTrainer(Trainer):
 
         return concatenated_batch
 
+    def unlikelihood_loss(
+        self,
+        policy_chosen_logps: torch.FloatTensor,
+        policy_rejected_log_one_minus_ps: torch.FloatTensor,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+        """Compute the Unlikelihood loss for a batch of policy model log probabilities.
+
+        Args:
+            policy_chosen_logps: Log probabilities of the policy model for the chosen responses, averaged over sequence. Shape: (batch_size,)
+            policy_rejected_log_one_minus_ps: log (1 - p) of the policy model for the rejected responses, averaged over sequence. Shape: (batch_size, )
+
+        Returns:
+            A tuple of three tensors: (losses, chosen_rewards, rejected_rewards).
+            The losses tensor contains the SimPO loss for each example in the batch.
+            The chosen_rewards and rejected_rewards tensors contain the rewards for the chosen and rejected responses, respectively.
+        """
+        # log p(yw) + log (1 - p(yl))
+        pi_logratios = policy_chosen_logps + policy_rejected_log_one_minus_ps
+        pi_logratios = pi_logratios.to(self.accelerator.device)
+        logits = pi_logratios - self.gamma_beta_ratio
+
+        if self.loss_type == "sigmoid":
+            losses = (
+                -F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
+                - F.logsigmoid(-self.beta * logits) * self.label_smoothing
+            )
+        elif self.loss_type == "hinge":
+            losses = torch.relu(1 - self.beta * logits)
+        else:
+            raise ValueError(
+                f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge']"
+            )
+
+        chosen_rewards = self.beta * policy_chosen_logps.to(self.accelerator.device).detach()
+        rejected_rewards = None # self.beta * policy_rejected_log_one_minus_ps.to(self.accelerator.device).detach()
+
+        return losses, chosen_rewards, rejected_rewards
+
     def simpo_loss(
         self,
         policy_chosen_logps: torch.FloatTensor,
@@ -641,8 +679,9 @@ class SimPOTrainer(Trainer):
         rejected_logits = all_logits[len_chosen:]
 
         chosen_labels = concatenated_batch["concatenated_labels"][:len_chosen]
+        rejected_labels = concatenated_batch["concatenated_labels"][len_chosen:]
 
-        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_labels)
+        return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_labels, rejected_labels)
 
     @staticmethod
     def get_batch_logps(
@@ -698,12 +737,43 @@ class SimPOTrainer(Trainer):
             policy_chosen_logits,
             policy_rejected_logits,
             chosen_labels,
+            rejected_labels,
         ) = self.concatenated_forward(model, batch)
 
-        losses, chosen_rewards, rejected_rewards = self.simpo_loss(
-            policy_chosen_logps,
-            policy_rejected_logps,
-        )
+        if "simpo" in self.args.run_name:
+            losses, chosen_rewards, rejected_rewards = self.simpo_loss(
+                policy_chosen_logps,
+                policy_rejected_logps,
+            )
+        # log(p(yl)), (batch_size, sequence_length)
+        elif "unlikelihood" in self.args.run_name:
+            rejected_labels[rejected_labels == self.label_pad_token_id] = 0
+            # p(yl_i, i = 1~vocab_size), (batch_size, sequence_length, vocab_size)
+            policy_rejected_ps_dist = torch.softmax(policy_rejected_logits, dim=-1)
+            # p(yl), (batch_size, sequence_length)
+            policy_rejected_ps_unavg = torch.gather(policy_rejected_ps_dist, dim=2, index=rejected_labels.unsqueeze(2)).squeeze(2)
+
+            # policy_rejected_logps_unavg = (
+            #     policy_rejected_logits, 
+            #     rejected_labels, 
+            #     average_log_prob=False, 
+            #     is_encoder_decoder=self.is_encoder_decoder, 
+            #     label_pad_token_id=self.label_pad_token_id
+            # )
+            assert policy_rejected_ps_unavg.shape == policy_rejected_logits.shape[:-1], f"{policy_rejected_logps_unavg.shape}, {policy_rejected_logits.shape[:-1]}"
+            # p(yl) = exp(log(p(yl))), (batch_size, sequence_length)
+            # log(1 - p(yl)) / |yl|, (batch_size,)
+            policy_rejected_one_minus_ps = torch.clamp(1.0 - policy_rejected_ps_unavg, min=1e-5)
+            policy_rejected_log_one_minus_ps = torch.log(policy_rejected_one_minus_ps).sum(-1) / (rejected_labels != self.label_pad_token_id).sum(-1)
+            assert policy_rejected_log_one_minus_ps.shape == policy_rejected_logits.shape[:1] == policy_chosen_logps.shape, f"{policy_rejected_log_one_minus_ps.shape}, {policy_rejected_logits.shape[:1]}, {policy_chosen_logps.shape}"
+            # policy_rejected_ps = torch.gather(policy_rejected_logits.softmax(-1), dim=2, index=rejected_labels.unsqueeze(2)).squeeze(2)
+            losses, chosen_rewards, rejected_rewards = self.unlikelihood_loss(
+                policy_chosen_logps,
+                policy_rejected_log_one_minus_ps,
+            )
+            rejected_rewards = self.beta * policy_rejected_logps.to(self.accelerator.device).detach()
+        else:
+            raise ValueError(f"Unknown run_name: {self.args.run_name}. Should be one of ['simpo', 'unlikelihood']")
 
         loss = losses.mean()
 
@@ -724,6 +794,8 @@ class SimPOTrainer(Trainer):
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
         metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
+        # logits size = (bs, seq_len, vocab_size) 
+        # Why logits are averaged over all the tokens in vocab, rather than over ground truth tokens?
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
 
