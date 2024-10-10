@@ -591,7 +591,7 @@ class SimPOTrainer(Trainer):
             )
 
         chosen_rewards = self.beta * policy_chosen_logps.to(self.accelerator.device).detach()
-        rejected_rewards = None # self.beta * policy_rejected_log_one_minus_ps.to(self.accelerator.device).detach()
+        rejected_rewards = self.beta * policy_rejected_log_one_minus_ps.to(self.accelerator.device).detach()
 
         return losses, chosen_rewards, rejected_rewards
 
@@ -647,6 +647,7 @@ class SimPOTrainer(Trainer):
             device=self.accelerator.device,
         )
         len_chosen = batch["chosen_labels"].shape[0]
+        assert len_chosen == concatenated_batch["concatenated_input_ids"].shape[0] // 2
 
         model_kwargs = (
             {
@@ -747,27 +748,21 @@ class SimPOTrainer(Trainer):
             )
         # log(p(yl)), (batch_size, sequence_length)
         elif "unlikelihood" in self.args.run_name:
+            rejected_labels = rejected_labels[:, 1:].clone()
+            policy_rejected_logits = policy_rejected_logits[:, :-1, :]
+            rejected_loss_mask = rejected_labels != self.label_pad_token_id
             rejected_labels[rejected_labels == self.label_pad_token_id] = 0
             # p(yl_i, i = 1~vocab_size), (batch_size, sequence_length, vocab_size)
             policy_rejected_ps_dist = torch.softmax(policy_rejected_logits, dim=-1)
             # p(yl), (batch_size, sequence_length)
             policy_rejected_ps_unavg = torch.gather(policy_rejected_ps_dist, dim=2, index=rejected_labels.unsqueeze(2)).squeeze(2)
 
-            # policy_rejected_logps_unavg = (
-            #     policy_rejected_logits, 
-            #     rejected_labels, 
-            #     average_log_prob=False, 
-            #     is_encoder_decoder=self.is_encoder_decoder, 
-            #     label_pad_token_id=self.label_pad_token_id
-            # )
             assert policy_rejected_ps_unavg.shape == policy_rejected_logits.shape[:-1], f"{policy_rejected_logps_unavg.shape}, {policy_rejected_logits.shape[:-1]}"
-            # p(yl) = exp(log(p(yl))), (batch_size, sequence_length)
+            policy_rejected_one_minus_ps = torch.clamp(1.0 - policy_rejected_ps_unavg, min=1e-8)
             # log(1 - p(yl)) / |yl|, (batch_size,)
-            policy_rejected_one_minus_ps = torch.clamp(1.0 - policy_rejected_ps_unavg, min=1e-5)
-            policy_rejected_log_one_minus_ps = torch.log(policy_rejected_one_minus_ps).sum(-1) / (rejected_labels != self.label_pad_token_id).sum(-1)
+            policy_rejected_log_one_minus_ps = torch.log(policy_rejected_one_minus_ps).sum(-1) / rejected_loss_mask.sum(-1)
             assert policy_rejected_log_one_minus_ps.shape == policy_rejected_logits.shape[:1] == policy_chosen_logps.shape, f"{policy_rejected_log_one_minus_ps.shape}, {policy_rejected_logits.shape[:1]}, {policy_chosen_logps.shape}"
-            # policy_rejected_ps = torch.gather(policy_rejected_logits.softmax(-1), dim=2, index=rejected_labels.unsqueeze(2)).squeeze(2)
-            losses, chosen_rewards, rejected_rewards = self.unlikelihood_loss(
+            losses, chosen_rewards, unlikelihood_rewards = self.unlikelihood_loss(
                 policy_chosen_logps,
                 policy_rejected_log_one_minus_ps,
             )
@@ -788,8 +783,21 @@ class SimPOTrainer(Trainer):
         
         reward_accuracies = (chosen_rewards > rejected_rewards).float()
 
+        if train_eval == "train":
+            grad_policy_chosen_logps = torch.autograd.grad(outputs=loss, inputs=policy_chosen_logps, retain_graph=True)[0]
+            metrics[f"{prefix}grads/policy_chosen_logps"] = grad_policy_chosen_logps.mean().cpu()
+            # metrics[f"{prefix}grads/policy_chosen_ps"] = (grad_policy_chosen_ps.sum() / chosen_loss_mask.sum()).cpu()
+            if "simpo" in self.args.run_name:
+                grad_policy_rejected_logps = torch.autograd.grad(outputs=loss, inputs=policy_rejected_logps, retain_graph=True)[0]
+                metrics[f"{prefix}grads/policy_rejected_logps"] = grad_policy_rejected_logps.mean().cpu()
+
         metrics[f"{prefix}rewards/chosen"] = chosen_rewards.mean().cpu()
         metrics[f"{prefix}rewards/rejected"] = rejected_rewards.mean().cpu()
+        if "unlikelihood" in self.args.run_name:
+            metrics[f"{prefix}rewards/unlikelihood"] = unlikelihood_rewards.mean().cpu()
+            if train_eval == "train":
+                grad_policy_rejected_log_one_minus_ps = torch.autograd.grad(outputs=loss, inputs=policy_rejected_log_one_minus_ps, retain_graph=True)[0]
+                metrics[f"{prefix}grads/policy_rejected_log_one_minus_ps"] = policy_rejected_log_one_minus_ps.mean().cpu()
         metrics[f"{prefix}rewards/accuracies"] = reward_accuracies.mean().cpu()
         metrics[f"{prefix}rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
         metrics[f"{prefix}logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
